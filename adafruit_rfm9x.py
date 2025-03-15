@@ -916,3 +916,86 @@ class RFM9x:
         # Clear interrupt.
         self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
         return packet
+
+    def receive_raw(
+        self,
+        *,
+        keep_listening: bool = True,
+        with_header: bool = False,
+        with_ack: bool = False,
+        timeout: Optional[float] = None
+    ) -> Optional[bytearray]:
+        """Wait to receive a packet from the receiver. If a packet is found the payload bytes
+        are returned, otherwise None is returned (which indicates the timeout elapsed with no
+        reception).
+        If keep_listening is True (the default) the chip will immediately enter listening mode
+        after reception of a packet, otherwise it will fall back to idle mode and ignore any
+        future reception.
+        All packets must have a 4-byte header for compatibility with the
+        RadioHead library.
+        The header consists of 4 bytes (To,From,ID,Flags). The default setting will  strip
+        the header before returning the packet to the caller.
+        If with_header is True then the 4 byte header will be returned with the packet.
+        The payload then begins at packet[4].
+        If with_ack is True, send an ACK after receipt (Reliable Datagram mode)
+        """
+        timed_out = False
+        if timeout is None:
+            timeout = self.receive_timeout
+        if timeout is not None:
+            # Wait for the payload_ready signal.  This is not ideal and will
+            # surely miss or overflow the FIFO when packets aren't read fast
+            # enough, however it's the best that can be done from Python without
+            # interrupt supports.
+            # Make sure we are listening for packets.
+            self.listen()
+            timed_out = False
+            if HAS_SUPERVISOR:
+                start = supervisor.ticks_ms()
+                while not timed_out and not self.rx_done():
+                    if ticks_diff(supervisor.ticks_ms(), start) >= timeout * 1000:
+                        timed_out = True
+            else:
+                start = time.monotonic()
+                while not timed_out and not self.rx_done():
+                    if time.monotonic() - start >= timeout:
+                        timed_out = True
+        # Payload ready is set, a packet is in the FIFO.
+        packet = None
+        # save last RSSI reading
+        self.last_rssi = self.rssi
+
+        # save the last SNR reading
+        self.last_snr = self.snr
+
+        # Enter idle mode to stop receiving other packets.
+        self.idle()
+        if not timed_out:
+            if self.enable_crc and self.crc_error():
+                self.crc_error_count += 1
+            else:
+                # Read the data from the FIFO.
+                # Read the length of the FIFO.
+                fifo_length = self._read_u8(_RH_RF95_REG_13_RX_NB_BYTES)
+                # Handle if the received packet is too small to include the 4 byte
+                # RadioHead header and at least one byte of data --reject this packet and ignore it.
+                if fifo_length > 0:  # read and clear the FIFO if anything in it
+                    current_addr = self._read_u8(_RH_RF95_REG_10_FIFO_RX_CURRENT_ADDR)
+                    self._write_u8(_RH_RF95_REG_0D_FIFO_ADDR_PTR, current_addr)
+                    packet = bytearray(fifo_length)
+                    # Read the packet.
+                    self._read_into(_RH_RF95_REG_00_FIFO, packet)
+                # Clear interrupt.
+                self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
+                if fifo_length < 5:
+                    packet = None
+
+        # Listen again if necessary and return the result packet.
+        if keep_listening:
+            self.listen()
+        else:
+            # Enter idle mode to stop receiving other packets.
+            self.idle()
+        # Clear interrupt.
+        self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
+        return packet
