@@ -763,6 +763,70 @@ class RFM9x:
         self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
         return not timed_out
 
+    def send_raw(
+        self,
+        data: ReadableBuffer,
+        *,
+        keep_listening: bool = False,
+        destination: Optional[int] = None,
+        node: Optional[int] = None,
+        identifier: Optional[int] = None,
+        flags: Optional[int] = None
+    ) -> bool:
+        """Send a string of data using the transmitter.
+        You can only send 252 bytes at a time
+        (limited by chip's FIFO size and appended headers).
+        This appends a 4 byte header to be compatible with the RadioHead library.
+        The header defaults to using the initialized attributes:
+        (destination,node,identifier,flags)
+        It may be temporarily overidden via the kwargs - destination,node,identifier,flags.
+        Values passed via kwargs do not alter the attribute settings.
+        The keep_listening argument should be set to True if you want to start listening
+        automatically after the packet is sent. The default setting is False.
+
+        Returns: True if success or False if the send timed out.
+        """
+        # Disable pylint warning to not use length as a check for zero.
+        # This is a puzzling warning as the below code is clearly the most
+        # efficient and proper way to ensure a precondition that the provided
+        # buffer be within an expected range of bounds. Disable this check.
+        # pylint: disable=len-as-condition
+        assert 0 < len(data) <= 252
+        # pylint: enable=len-as-condition
+        self.idle()  # Stop receiving to clear FIFO and keep it clear.
+        # Fill the FIFO with a packet to send.
+        self._write_u8(_RH_RF95_REG_0D_FIFO_ADDR_PTR, 0x00)  # FIFO starts at 0.
+        # Combine header and data to form payload
+        payload = data
+        # Write payload.
+        self._write_from(_RH_RF95_REG_00_FIFO, payload)
+        # Write payload and header length.
+        self._write_u8(_RH_RF95_REG_22_PAYLOAD_LENGTH, len(payload))
+        # Turn on transmit mode to send out the packet.
+        self.transmit()
+        # Wait for tx done interrupt with explicit polling (not ideal but
+        # best that can be done right now without interrupts).
+        timed_out = False
+        if HAS_SUPERVISOR:
+            start = supervisor.ticks_ms()
+            while not timed_out and not self.tx_done():
+                if ticks_diff(supervisor.ticks_ms(), start) >= self.xmit_timeout * 1000:
+                    timed_out = True
+        else:
+            start = time.monotonic()
+            while not timed_out and not self.tx_done():
+                if time.monotonic() - start >= self.xmit_timeout:
+                    timed_out = True
+        # Listen again if necessary and return the result packet.
+        if keep_listening:
+            self.listen()
+        else:
+            # Enter idle mode to stop receiving other packets.
+            self.idle()
+        # Clear interrupt.
+        self._write_u8(_RH_RF95_REG_12_IRQ_FLAGS, 0xFF)
+        return not timed_out
+
     def send_with_ack(self, data: ReadableBuffer) -> bool:
         """Reliable Datagram mode:
         Send a packet with data and wait for an ACK response.
